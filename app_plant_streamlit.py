@@ -18,7 +18,7 @@ from torchvision import models, transforms
 from PIL import Image
 
 # 2) Configuration - adjust these if needed
-MODEL_PATH = "plant_model.pth"   # local checkpoint filename (state_dict or checkpoint)
+MODEL_PATH = "best_model.pth"   # local checkpoint filename (state_dict or checkpoint)
 CLASS_NAMES = [                   # placeholder: replace with your actual class names in model order
     "Apple___healthy", "Apple___scab", "Apple___black_rot", "Apple___rust"
     # add all classes here...
