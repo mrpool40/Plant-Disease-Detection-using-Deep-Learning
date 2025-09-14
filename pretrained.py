@@ -1,213 +1,259 @@
-# app_plant_streamlit.py
-import io
-import os
-import requests
+# Colab inline Plant Disease Detection dashboard (PyTorch ResNet18)
+# Paste & run this single cell in Colab.
+
+# 0) Install required packages (first run)
+!pip install -q ipywidgets matplotlib opencv-python-headless torch torchvision pillow requests
+
+# 1) Imports
+import os, io, requests, time
+from pathlib import Path
+from IPython.display import display, clear_output
+import ipywidgets as widgets
 import numpy as np
 import cv2
-import streamlit as st
+import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 from torchvision import models, transforms
 from PIL import Image
 
-st.set_page_config(page_title="Plant Disease Detection", layout="centered")
-
-# -------------------------
-# Configuration
-# -------------------------
-MODEL_PATH = "plant_model.pth"   # change to your model path or preload a HF link
-CLASS_NAMES = [
-    # Replace with your actual class names in the same order the model was trained
-    "Apple___healthy", "Apple___scab", "Apple___black_rot", "Apple___rust",
-    # ... add the rest from your dataset
+# 2) Configuration - adjust these if needed
+MODEL_PATH = "best_model.pth"   # local checkpoint filename (state_dict or checkpoint)
+CLASS_NAMES = [                   # placeholder: replace with your actual class names in model order
+    "Apple___healthy", "Apple___scab", "Apple___black_rot", "Apple___rust"
+    # add all classes here...
 ]
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DISPLAY_MAX = 800  # scale large images for display
 
-# -------------------------
-# Utility functions
-# -------------------------
-@st.cache_resource
-def load_model(path=MODEL_PATH, num_classes=None):
-    """Load a PyTorch ResNet18 and attach saved weights (state_dict)."""
+# 3) Model loading utility
+def load_resnet18_model(model_path=MODEL_PATH, num_classes=None, device=DEVICE):
     if num_classes is None:
         num_classes = len(CLASS_NAMES)
     model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
     model.fc = torch.nn.Linear(model.fc.in_features, num_classes)
-    model = model.to(DEVICE)
-    if os.path.exists(path) and os.path.getsize(path) > 0:
+    model.to(device)
+    model.eval()
+    if os.path.exists(model_path) and os.path.getsize(model_path) > 0:
         try:
-            state = torch.load(path, map_location=DEVICE)
-            # state may be either state_dict or a checkpoint dict
-            if isinstance(state, dict) and "model_state_dict" in state:
-                state = state["model_state_dict"]
+            ckpt = torch.load(model_path, map_location=device)
+            # support both state_dict and checkpoint dict containing 'model_state_dict'
+            if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+                state = ckpt["model_state_dict"]
+            elif isinstance(ckpt, dict) and all(k.startswith("module.") or k in model.state_dict() for k in ckpt.keys()):
+                # might already be state_dict
+                state = ckpt
+            else:
+                # try direct as state_dict
+                state = ckpt
             model.load_state_dict(state)
-            model.eval()
-            st.info(f"Loaded model from {path}")
+            print(f"Loaded model weights from {model_path}")
         except Exception as e:
-            st.warning(f"Failed to load weights from {path}: {e}")
+            print("Warning: failed to load model weights:", e)
+            print("Model architecture created but weights not loaded.")
     else:
-        st.warning(f"No model file found at {path}. App will still run but predictions will be random.")
+        print(f"No model file found at {model_path}. Model created with random weights. Place your .pth at this path to use trained weights.")
     return model
 
-def download_image_from_url(url):
-    r = requests.get(url, timeout=10)
+# instantiate model (may take a moment)
+print("Initializing model (this may take a few seconds)... Device:", DEVICE)
+model = load_resnet18_model(MODEL_PATH, num_classes=len(CLASS_NAMES), device=DEVICE)
+
+# 4) Image utilities
+def download_image_from_url(url, timeout=10):
+    r = requests.get(url, timeout=timeout)
     r.raise_for_status()
     arr = np.frombuffer(r.content, dtype=np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     return img
 
-def read_image_from_upload(uploaded_file):
-    data = uploaded_file.read()
-    arr = np.frombuffer(data, dtype=np.uint8)
+def read_image_from_upload(uploaded):
+    # uploaded is ipywidgets FileUpload .value -> dict of {filename: {'content': bytes, ...}}
+    if not uploaded:
+        return None
+    # handle both dict and list-like structures
+    if isinstance(uploaded, dict):
+        first = next(iter(uploaded.values()))
+        b = first['content']
+    else:
+        # list-like
+        first = uploaded[0]
+        if isinstance(first, dict) and 'content' in first:
+            b = first['content']
+        else:
+            # maybe object with .data
+            b = first
+    arr = np.frombuffer(b, dtype=np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     return img
 
+def scale_for_display(img, max_side=DISPLAY_MAX):
+    h,w = img.shape[:2]
+    if max(h,w) <= max_side:
+        return img, 1.0
+    scale = max_side / max(h,w)
+    neww = int(w*scale); newh = int(h*scale)
+    return cv2.resize(img, (neww,newh)), scale
+
+# 5) Leaf detection: simple HSV-based segmentation -> largest contour bbox
 def leaf_detection_bbox(img_bgr):
-    """
-    Simple color-based leaf segmentation + largest contour bounding box.
-    Returns bbox as (x,y,w,h) or None if not found.
-    """
     if img_bgr is None:
-        return None
-    # Convert to HSV and threshold for green-ish colors (tweak ranges if needed)
+        return None, None
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-    # HSV range for leaves — adjust if your leaves look different
-    lower = np.array([20, 30, 20])   # H,S,V
+    # HSV range for green (tweak if your leaves differ)
+    lower = np.array([20, 30, 20])
     upper = np.array([100, 255, 255])
     mask = cv2.inRange(hsv, lower, upper)
-
-    # Clean mask
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7,7))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-
-    # Find contours and pick the largest
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
-        return None
+        return None, mask
     largest = max(contours, key=cv2.contourArea)
-    if cv2.contourArea(largest) < 500:  # too small -> ignore
-        return None
+    if cv2.contourArea(largest) < 500:  # ignore tiny
+        return None, mask
     x,y,w,h = cv2.boundingRect(largest)
     return (x,y,w,h), mask
 
-def preprocess_for_model(crop_bgr, img_size=224):
-    """Preprocess crop for ResNet: BGR->RGB, resize, normalize, to tensor."""
-    img = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-    img = cv2.resize(img, (img_size, img_size))
-    img = Image.fromarray(img)
-    tf = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])
-    ])
-    x = tf(img).unsqueeze(0).to(DEVICE)  # 1,C,H,W
-    return x
+# 6) Preprocess crop for PyTorch ResNet
+tf_preprocess = transforms.Compose([
+    transforms.ToPILImage(),
+    transforms.Resize((224,224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])
+])
 
-def predict(model, crop_bgr, topk=3):
-    x = preprocess_for_model(crop_bgr)
+def preprocess_crop_for_model(crop_bgr):
+    rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+    tensor = tf_preprocess(rgb).unsqueeze(0).to(DEVICE)
+    return tensor
+
+def predict_model_on_crop(crop_bgr, topk=5):
+    if crop_bgr is None:
+        return []
+    x = preprocess_crop_for_model(crop_bgr)
     with torch.no_grad():
         out = model(x)
         probs = F.softmax(out, dim=1).cpu().numpy()[0]
-        topk_idx = probs.argsort()[::-1][:topk]
-        results = [(CLASS_NAMES[i], float(probs[i])) for i in topk_idx]
-    return results, probs
+    top_idx = probs.argsort()[::-1][:topk]
+    return [(CLASS_NAMES[i] if i < len(CLASS_NAMES) else str(i), float(probs[i])) for i in top_idx], probs
 
-# -------------------------
-# Main UI
-# -------------------------
-st.title("🌿 Plant Disease Detection (ResNet18)")
+# 7) Widgets: URL box, file upload, button and output area
+url_box = widgets.Text(value='', placeholder='Paste image URL (http/https) here', description='Image URL:', layout=widgets.Layout(width='70%'))
+file_uploader = widgets.FileUpload(accept='image/*', multiple=False)
+run_button = widgets.Button(description='Detect & Predict', button_style='primary')
+output = widgets.Output(layout=widgets.Layout(border='1px solid #ccc', padding='10px'))
 
-st.markdown("""
-Upload a leaf image or paste an image URL. The app will try to detect the leaf, draw a bounding box,
-crop the leaf region and predict the disease using a pretrained ResNet18 model.
-""")
-
-col1, col2 = st.columns([3,1])
-
-with col1:
-    url = st.text_input("Image URL (http/https)", "")
-    uploaded_file = st.file_uploader("Or upload an image file", type=["jpg","jpeg","png"])
-
-with col2:
-    st.write("Model")
-    st.write(f"Device: **{DEVICE}**")
-    model_path = st.text_input("Model path (optional)", MODEL_PATH)
-    if st.button("Reload model"):
-        # reload by clearing cache resource (Streamlit caches persist until code changes)
-        load_model.cache_clear()
-        model = load_model(model_path, num_classes=len(CLASS_NAMES))
-    else:
-        model = load_model(model_path, num_classes=len(CLASS_NAMES))
-
-# Load image
-img = None
-if url:
+# Helper: read uploaded file value (ipywidgets returns dict in Jupyter, in Colab it behaves similarly)
+def get_uploaded_value(uploader_widget):
+    # uploader_widget.value is a dict in classic ipywidgets: filename -> metadata
     try:
-        img = download_image_from_url(url)
-    except Exception as e:
-        st.error(f"Failed to download image: {e}")
-elif uploaded_file is not None:
-    try:
-        img = read_image_from_upload(uploaded_file)
-    except Exception as e:
-        st.error(f"Failed to read uploaded image: {e}")
+        val = uploader_widget.value
+        if not val:
+            return None
+        # If it's dict-like
+        if isinstance(val, dict):
+            first = next(iter(val.values()))
+            return first['content']
+        # If it's list-like
+        if isinstance(val, (list, tuple)):
+            # each item may be dict
+            first = val[0]
+            if isinstance(first, dict) and 'content' in first:
+                return first['content']
+            # maybe it's an UploadedFile object - read .data?
+            return first
+    except Exception:
+        return None
 
-if img is None:
-    st.info("No image loaded yet. Paste a URL or upload one.")
-    st.stop()
+# 8) Main action handler
+def on_run_clicked(b):
+    with output:
+        clear_output(wait=True)
+        print("Processing... (this may take a few seconds)")
+        # 1) load image (URL takes precedence)
+        img = None
+        if url_box.value.strip():
+            try:
+                img = download_image_from_url(url_box.value.strip())
+            except Exception as e:
+                print("Failed to download URL:", e)
+                img = None
+        if img is None and file_uploader.value:
+            try:
+                content = get_uploaded_value(file_uploader)
+                if content is None:
+                    # older API: file_uploader.value is a list-like with dicts
+                    content = list(file_uploader.value)[0]['content'] if file_uploader.value else None
+                if content is None:
+                    print("Unable to read uploaded file from widget.")
+                    return
+                arr = np.frombuffer(content, dtype=np.uint8)
+                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            except Exception as e:
+                print("Failed to read uploaded file:", e)
+                img = None
 
-# Resize preview for display (keep original for crop)
-preview = img.copy()
-preview_h, preview_w = preview.shape[:2]
-display_max = 800
-if max(preview_h, preview_w) > display_max:
-    scale = display_max / max(preview_h, preview_w)
-    preview = cv2.resize(preview, (int(preview_w*scale), int(preview_h*scale)))
+        if img is None:
+            print("No image provided. Paste an URL or upload an image.")
+            return
 
-# Detect leaf bounding box
-det = leaf_detection_bbox(img)
-if det is None:
-    st.warning("No leaf detected using the simple color segmentation. The app will predict on the full image.")
-    crop = img.copy()
-    bbox = None
-else:
-    (x,y,w,h), mask = det
-    crop = img[y:y+h, x:x+w]
-    bbox = (x,y,w,h)
+        # 2) detect leaf bbox
+        bbox, mask = leaf_detection_bbox(img)
+        if bbox is None:
+            print("No leaf detected with simple segmentation. Predicting on full image.")
+            crop = img.copy()
+        else:
+            x,y,w,h = bbox
+            crop = img[y:y+h, x:x+w]
 
-# Run prediction
-results, probs = predict(model, crop, topk=5)
+        # 3) predict
+        try:
+            results, probs = predict_model_on_crop(crop, topk=5)
+        except Exception as e:
+            print("Prediction failed:", e)
+            return
 
-# Annotate image (draw bbox + top label)
-annot = preview.copy()
-if bbox is not None:
-    # scale bbox to preview size if preview was resized
-    scale_x = preview.shape[1] / img.shape[1]
-    scale_y = preview.shape[0] / img.shape[0]
-    x_s = int(x * scale_x); y_s = int(y * scale_y)
-    w_s = int(w * scale_x); h_s = int(h * scale_y)
-    cv2.rectangle(annot, (x_s, y_s), (x_s+w_s, y_s+h_s), (0,255,0), 2)
-    label_text = f"{results[0][0]} ({results[0][1]*100:.1f}%)"
-    cv2.putText(annot, label_text, (x_s, max(0,y_s-8)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
-else:
-    # whole-image label
-    label_text = f"{results[0][0]} ({results[0][1]*100:.1f}%)"
-    cv2.putText(annot, label_text, (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,255,0), 2)
+        # 4) prepare annotated display image (scaled)
+        disp_img, scale = scale_for_display(img, max_side=DISPLAY_MAX)
+        annotated = disp_img.copy()
+        if bbox is not None:
+            x_s = int(x*scale); y_s = int(y*scale); w_s = int(w*scale); h_s = int(h*scale)
+            cv2.rectangle(annotated, (x_s,y_s), (x_s+w_s, y_s+h_s), (0,255,0), 2)
+            label_text = f"{results[0][0]} ({results[0][1]*100:.1f}%)"
+            cv2.putText(annotated, label_text, (x_s, max(0,y_s-8)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
+        else:
+            label_text = f"{results[0][0]} ({results[0][1]*100:.1f}%)"
+            cv2.putText(annotated, label_text, (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,255,0), 2)
 
-# Display annotated image
-st.image(cv2.cvtColor(annot, cv2.COLOR_BGR2RGB), caption="Annotated image", use_column_width=True)
+        # 5) show annotated image inline
+        fig, ax = plt.subplots(figsize=(8,8))
+        ax.imshow(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB))
+        ax.axis('off')
+        plt.show()
 
-# Show results table
-st.subheader("Top predictions")
-for name, p in results[:5]:
-    st.write(f"- **{name}** — {p*100:.2f}%")
+        # 6) print results table
+        print("Top predictions:")
+        for i,(name, p) in enumerate(results):
+            print(f" {i+1}. {name} — {p*100:.2f}%")
 
-# Optionally show the segmentation mask
-if bbox is not None and st.checkbox("Show segmentation mask"):
-    mask_vis = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-    overlaid = cv2.addWeighted(img, 0.6, mask_vis, 0.4, 0)
-    st.image(cv2.cvtColor(overlaid, cv2.COLOR_BGR2RGB), caption="Segmentation overlay", use_column_width=True)
+        # 7) optionally show mask
+        if bbox is not None:
+            # show small mask visualization
+            mask_rgb = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+            over = cv2.addWeighted(cv2.resize(img, (mask_rgb.shape[1], mask_rgb.shape[0])), 0.6, mask_rgb, 0.4, 0)
+            fig2, ax2 = plt.subplots(figsize=(6,4))
+            ax2.imshow(cv2.cvtColor(over, cv2.COLOR_BGR2RGB))
+            ax2.axis('off')
+            plt.title("Segmentation overlay (for debug)")
+            plt.show()
 
-st.markdown("---")
-st.caption("Notes: Adjust leaf_detection_bbox() color ranges if your dataset's leaves are different in color. "
-           "Replace CLASS_NAMES and MODEL_PATH with your actual classes and model file.")
+# bind button
+run_button.on_click(on_run_clicked)
+
+# 9) Layout & display
+title = widgets.HTML("<h3>Plant Disease Detection — Colab inline dashboard</h3><p>Paste an image URL or upload a file, then click <b>Detect & Predict</b>.</p>")
+controls = widgets.HBox([url_box, run_button])
+uploader_row = widgets.HBox([widgets.Label("Or upload:"), file_uploader])
+display(title, controls, uploader_row, output)
